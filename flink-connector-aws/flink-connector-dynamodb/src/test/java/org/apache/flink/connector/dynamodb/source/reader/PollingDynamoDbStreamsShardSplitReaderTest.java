@@ -30,6 +30,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.dynamodb.model.Record;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -53,6 +54,9 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
     private Map<String, DynamoDbStreamsShardMetrics> shardMetricGroupMap;
     private static final String TEST_SHARD_ID = TestUtil.generateShardId(1);
 
+    private static final Duration NON_EMPTY_POLLING_DELAY_MILLIS = Duration.ofMillis(250);
+    private static final Duration EMPTY_POLLING_DELAY_MILLIS = Duration.ofMillis(1000);
+
     @BeforeEach
     public void init() {
         testStreamProxy = getTestStreamProxy();
@@ -64,7 +68,11 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
                 new DynamoDbStreamsShardMetrics(
                         TestUtil.getTestSplit(TEST_SHARD_ID), metricListener.getMetricGroup()));
         splitReader =
-                new PollingDynamoDbStreamsShardSplitReader(testStreamProxy, shardMetricGroupMap);
+                new PollingDynamoDbStreamsShardSplitReader(
+                        testStreamProxy,
+                        NON_EMPTY_POLLING_DELAY_MILLIS,
+                        EMPTY_POLLING_DELAY_MILLIS,
+                        shardMetricGroupMap);
     }
 
     @Test
@@ -117,6 +125,8 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         // When fetching records
         List<Record> records = new ArrayList<>();
         for (int i = 0; i < expectedRecords.size(); i++) {
+            // Wait for non-empty poll delay after getting records
+            Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
             RecordsWithSplitIds<Record> retrievedRecords = splitReader.fetch();
             records.addAll(readAllRecords(retrievedRecords));
         }
@@ -155,6 +165,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         // When records are fetched
         List<Record> fetchedRecords = new ArrayList<>();
         for (int i = 0; i < expectedRecords.size(); i++) {
+            Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
             RecordsWithSplitIds<Record> retrievedRecords = splitReader.fetch();
             fetchedRecords.addAll(readAllRecords(retrievedRecords));
         }
@@ -173,6 +184,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         splitReader.handleSplitsChanges(new SplitsAddition<>(Collections.singletonList(split)));
         testStreamProxy.setShouldCompleteNextShard(true);
 
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
         // When fetching records
         RecordsWithSplitIds<Record> retrievedRecords = splitReader.fetch();
 
@@ -197,6 +209,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         // When fetching records
         List<Record> fetchedRecords = new ArrayList<>();
         testStreamProxy.setShouldCompleteNextShard(true);
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
         RecordsWithSplitIds<Record> retrievedRecords = splitReader.fetch();
 
         // Then records can be read successfully, with finishedSplit returned once all records are
@@ -232,6 +245,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
                 TestUtil.STREAM_ARN, splitId, Collections.singletonList(expectedRecords.get(1)));
         splitReader.handleSplitsChanges(new SplitsAddition<>(Collections.singletonList(testSplit)));
 
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
         // read data from split
         RecordsWithSplitIds<Record> records = splitReader.fetch();
         assertThat(readAllRecords(records)).containsExactlyInAnyOrder(expectedRecords.get(0));
@@ -248,6 +262,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         // resume split
         splitReader.pauseOrResumeSplits(
                 Collections.emptyList(), Collections.singletonList(testSplit));
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
         records = splitReader.fetch();
         assertThat(readAllRecords(records)).containsExactlyInAnyOrder(expectedRecords.get(1));
     }
@@ -306,6 +321,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         // read data from splits and verify that only records from split 2 were fetched by reader
         List<Record> fetchedRecords = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
+            Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
             RecordsWithSplitIds<Record> records = splitReader.fetch();
             fetchedRecords.addAll(readAllRecords(records));
         }
@@ -320,8 +336,101 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         for (int i = 0; i < 10; i++) {
             RecordsWithSplitIds<Record> records = splitReader.fetch();
             fetchedRecords.addAll(readAllRecords(records));
+            Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
         }
         assertThat(fetchedRecords).containsExactly(recordsFromSplit3.toArray(new Record[0]));
+    }
+
+    @Test
+    void testPollingDelayForEmptyRecords() throws Exception {
+        // Given assigned split with no records
+        testStreamProxy.addShards(TEST_SHARD_ID);
+        splitReader.handleSplitsChanges(
+                new SplitsAddition<>(Collections.singletonList(getTestSplit(TEST_SHARD_ID))));
+
+        // First poll - should return empty records
+        RecordsWithSplitIds<Record> firstPoll = splitReader.fetch();
+        assertThat(firstPoll.nextRecordFromSplit()).isNull();
+        assertThat(firstPoll.nextSplit()).isNull();
+        assertThat(firstPoll.finishedSplits()).isEmpty();
+
+        // Immediate second poll - should return empty due to polling delay
+        RecordsWithSplitIds<Record> secondPoll = splitReader.fetch();
+        assertThat(secondPoll.nextRecordFromSplit()).isNull();
+        assertThat(secondPoll.nextSplit()).isNull();
+        assertThat(secondPoll.finishedSplits()).isEmpty();
+    }
+
+    @Test
+    void testLessPollingDelayForNonEmptyRecords() throws Exception {
+        // Given assigned split with records
+        testStreamProxy.addShards(TEST_SHARD_ID);
+        Record record1 = getTestRecord("data-1");
+        Record record2 = getTestRecord("data-2");
+
+        testStreamProxy.addRecords(
+                TestUtil.STREAM_ARN, TEST_SHARD_ID, Collections.singletonList(record1));
+
+        splitReader.handleSplitsChanges(
+                new SplitsAddition<>(Collections.singletonList(getTestSplit(TEST_SHARD_ID))));
+
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
+        // First poll - should return record1
+        RecordsWithSplitIds<Record> firstPoll = splitReader.fetch();
+        assertThat(readAllRecords(firstPoll)).containsExactly(record1);
+
+        // Add second record
+        testStreamProxy.addRecords(
+                TestUtil.STREAM_ARN, TEST_SHARD_ID, Collections.singletonList(record2));
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
+
+        // Immediate second poll - should return record2 despite no delay
+        RecordsWithSplitIds<Record> secondPoll = splitReader.fetch();
+        assertThat(readAllRecords(secondPoll)).containsExactly(record2);
+    }
+
+    @Test
+    void testPollingDelayRespectedAfterEmptyPoll() throws Exception {
+        // Given assigned split with records
+        testStreamProxy.addShards(TEST_SHARD_ID);
+        splitReader.handleSplitsChanges(
+                new SplitsAddition<>(Collections.singletonList(getTestSplit(TEST_SHARD_ID))));
+
+        // First poll - empty
+        RecordsWithSplitIds<Record> firstPoll = splitReader.fetch();
+        assertThat(firstPoll.nextRecordFromSplit()).isNull();
+
+        // Add a record but try to poll before empty poll delay expires
+        Record record = getTestRecord("data-1");
+        testStreamProxy.addRecords(
+                TestUtil.STREAM_ARN, TEST_SHARD_ID, Collections.singletonList(record));
+
+        // Second poll - should still be empty due to empty poll delay
+        RecordsWithSplitIds<Record> secondPoll = splitReader.fetch();
+        assertThat(secondPoll.nextRecordFromSplit()).isNull();
+
+        // Wait for empty poll delay
+        Thread.sleep(EMPTY_POLLING_DELAY_MILLIS.toMillis());
+
+        // Third poll - should get the record
+        RecordsWithSplitIds<Record> thirdPoll = splitReader.fetch();
+        assertThat(readAllRecords(thirdPoll)).containsExactly(record);
+
+        // Add new record but try to poll before non-empty poll delay expires
+        Record newRecord = getTestRecord("data-2");
+        testStreamProxy.addRecords(
+                TestUtil.STREAM_ARN, TEST_SHARD_ID, Collections.singletonList(newRecord));
+
+        // Fourth poll - should be empty due to non-empty poll delay
+        RecordsWithSplitIds<Record> fourthPoll = splitReader.fetch();
+        assertThat(fourthPoll.nextRecordFromSplit()).isNull();
+
+        // Wait for non-empty poll delay
+        Thread.sleep(NON_EMPTY_POLLING_DELAY_MILLIS.toMillis());
+
+        // Fifth poll - should get the new record
+        RecordsWithSplitIds<Record> fifthPoll = splitReader.fetch();
+        assertThat(readAllRecords(fifthPoll)).containsExactly(newRecord);
     }
 
     @Test
