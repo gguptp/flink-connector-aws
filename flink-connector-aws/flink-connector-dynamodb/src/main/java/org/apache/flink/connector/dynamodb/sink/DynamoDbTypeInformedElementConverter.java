@@ -176,7 +176,7 @@ public class DynamoDbTypeInformedElementConverter<T>
                     tableSchemaBuilder,
                     propertyDescriptor.getName(),
                     BeanAttributeGetter.create(
-                            typeInfo.getTypeClass(), propertyDescriptor.getReadMethod()),
+                            typeInfo.getTypeClass(), propertyDescriptor.getReadMethod(), null),
                     fieldInfo);
         }
 

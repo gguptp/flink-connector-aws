@@ -25,6 +25,7 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants;
 import org.apache.flink.connector.dynamodb.source.enumerator.assigner.ShardAssignerFactory;
 import org.apache.flink.connector.dynamodb.source.enumerator.event.SplitsFinishedEvent;
+import org.apache.flink.connector.dynamodb.source.enumerator.event.SplitsFinishedEventContext;
 import org.apache.flink.connector.dynamodb.source.proxy.StreamProxy;
 import org.apache.flink.connector.dynamodb.source.split.DynamoDbStreamsShardSplit;
 import org.apache.flink.connector.dynamodb.source.split.StartingPosition;
@@ -304,21 +305,29 @@ class DynamoDbStreamsSourceEnumeratorTest {
                     };
             streamProxy.addShards(childShards);
             enumerator.handleSourceEvent(
-                    subtaskId, new SplitsFinishedEvent(Collections.singleton(shards[2].shardId())));
-            // Given no resharding occurs (list of shards remains the same)
-            // When first periodic discovery runs
-            context.runPeriodicCallable(0);
-            // Then no additional splits are assigned
-            SplitsAssignment<DynamoDbStreamsShardSplit> periodicDiscoverySplitAssignment =
-                    context.getSplitsAssignmentSequence().get(2);
+                    subtaskId,
+                    new SplitsFinishedEvent(
+                            Collections.singleton(
+                                    new SplitsFinishedEventContext(
+                                            shards[2].shardId(),
+                                            Collections.singletonList(childShards[0])))));
+
             DynamoDbStreamsShardSplit childSplit =
                     new DynamoDbStreamsShardSplit(
                             STREAM_ARN,
                             childShards[0].shardId(),
                             StartingPosition.fromStart(),
                             shards[2].shardId());
-            assertThat(periodicDiscoverySplitAssignment.assignment().get(subtaskId))
+            assertThat(context.getSplitsAssignmentSequence().get(1).assignment().get(subtaskId))
                     .containsExactly(childSplit);
+            // Given no resharding occurs (list of shards remains the same)
+            // When first periodic discovery runs
+            context.runPeriodicCallable(0);
+            // Then no additional splits are assigned
+            SplitsAssignment<DynamoDbStreamsShardSplit> periodicDiscoverySplitAssignment =
+                    context.getSplitsAssignmentSequence().get(2);
+            assertThat(periodicDiscoverySplitAssignment.assignment().get(subtaskId))
+                    .isNullOrEmpty();
         }
     }
 
@@ -765,7 +774,12 @@ class DynamoDbStreamsSourceEnumeratorTest {
             context.runNextOneTimeCallable();
 
             enumerator.handleSourceEvent(
-                    1, new SplitsFinishedEvent(Collections.singleton(completedShard.shardId())));
+                    1,
+                    new SplitsFinishedEvent(
+                            Collections.singleton(
+                                    new SplitsFinishedEventContext(
+                                            completedShard.shardId(),
+                                            Collections.singletonList(shards[1])))));
 
             // When restored from state
             DynamoDbStreamsSourceEnumeratorState snapshotState = enumerator.snapshotState(1);

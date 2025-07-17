@@ -76,6 +76,9 @@ public class DynamodbStreamsSourceConfigConstants {
     public static final String BASE_DDB_STREAMS_USER_AGENT_PREFIX_FORMAT =
             "Apache Flink %s (%s) DynamoDb Streams Connector";
 
+    public static final String DYNAMODB_STREAMS_THROTTLING_EXCEPTION_ERROR_CODE =
+            "ThrottlingException";
+
     public static final ConfigOption<Duration>
             DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_EMPTY_POLLS =
                     ConfigOptions.key("flink.dynamodbstreams.getrecords.empty.mindelay")
@@ -90,6 +93,10 @@ public class DynamodbStreamsSourceConfigConstants {
                             .defaultValue(Duration.ofMillis(250))
                             .withDescription(
                                     "The default idle time between non-empty polls for DynamoDB Streams GetRecords API");
+
+    public static final int MAX_RETRY_ATTEMPTS_FOR_CHILD_SHARDS = 5;
+    public static final Duration CHILD_SHARD_DISCOVERY_MIN_DELAY = Duration.ofMillis(100);
+    public static final Duration CHILD_SHARD_DISCOVERY_MAX_DELAY = Duration.ofMillis(1000);
 
     /** DynamoDb Streams identifier for user agent prefix. */
     public static final String DDB_STREAMS_CLIENT_USER_AGENT_PREFIX =

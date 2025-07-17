@@ -23,6 +23,7 @@ import org.apache.flink.connector.dynamodb.source.split.StartingPosition;
 import org.apache.flink.connector.dynamodb.source.util.ListShardsResult;
 
 import software.amazon.awssdk.services.dynamodb.model.GetRecordsResponse;
+import software.amazon.awssdk.services.dynamodb.model.ShardFilter;
 
 import javax.annotation.Nullable;
 
@@ -40,6 +41,8 @@ public interface StreamProxy extends Closeable {
      * @return shard list
      */
     ListShardsResult listShards(String streamArn, @Nullable String lastSeenShardId);
+
+    ListShardsResult listShardsWithFilter(String streamArn, ShardFilter shardFilter);
 
     /**
      * Retrieves records from the stream.

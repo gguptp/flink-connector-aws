@@ -29,10 +29,12 @@ public class DynamoDbStreamsShardSplitState {
     private final DynamoDbStreamsShardSplit dynamoDbStreamsShardSplit;
     private StartingPosition nextStartingPosition;
     private String nextShardIterator;
+    private boolean hasShardEndReached;
 
     public DynamoDbStreamsShardSplitState(DynamoDbStreamsShardSplit dynamoDbStreamsShardSplit) {
         this.dynamoDbStreamsShardSplit = dynamoDbStreamsShardSplit;
         this.nextStartingPosition = dynamoDbStreamsShardSplit.getStartingPosition();
+        this.hasShardEndReached = false;
     }
 
     public DynamoDbStreamsShardSplit getDynamoDbStreamsShardSplit() {
@@ -69,5 +71,13 @@ public class DynamoDbStreamsShardSplitState {
 
     public void setNextShardIterator(String nextShardIterator) {
         this.nextShardIterator = nextShardIterator;
+    }
+
+    public boolean isHasShardEndReached() {
+        return hasShardEndReached;
+    }
+
+    public void setHasShardEndReached(boolean hasShardEndReached) {
+        this.hasShardEndReached = hasShardEndReached;
     }
 }
