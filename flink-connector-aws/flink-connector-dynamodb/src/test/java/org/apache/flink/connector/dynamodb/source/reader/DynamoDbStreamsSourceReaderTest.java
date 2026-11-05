@@ -29,6 +29,7 @@ import org.apache.flink.connector.dynamodb.source.split.DynamoDbStreamsShardSpli
 import org.apache.flink.connector.dynamodb.source.split.DynamoDbStreamsShardSplitState;
 import org.apache.flink.connector.dynamodb.source.split.StartingPosition;
 import org.apache.flink.connector.dynamodb.source.util.DynamoDbStreamsContextProvider;
+import org.apache.flink.connector.dynamodb.source.util.DynamoDbStreamsProxyProvider;
 import org.apache.flink.connector.dynamodb.source.util.TestUtil;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderContext;
 import org.apache.flink.metrics.testutils.MetricListener;
@@ -89,6 +90,32 @@ class DynamoDbStreamsSourceReaderTest {
                         testingReaderContext,
                         new ConcurrentHashMap<>(),
                         shardMetricGroupMap);
+    }
+
+    @Test
+    void testCloseClosesSharedStreamProxy() throws Exception {
+        DynamoDbStreamsProxyProvider.TestDynamoDbStreamsProxy sharedStreamProxy =
+                getTestStreamProxy();
+        DynamoDbStreamsSourceReader<TestData> reader =
+                new DynamoDbStreamsSourceReader<>(
+                        new SingleThreadFetcherManager<>(
+                                () ->
+                                        new PollingDynamoDbStreamsShardSplitReader(
+                                                sharedStreamProxy,
+                                                NON_EMPTY_POLLING_DELAY_MILLIS,
+                                                EMPTY_POLLING_DELAY_MILLIS,
+                                                new ConcurrentHashMap<>(),
+                                                shardMetricGroupMap)),
+                        new DynamoDbStreamsRecordEmitter<>(null),
+                        new Configuration(),
+                        testingReaderContext,
+                        new ConcurrentHashMap<>(),
+                        shardMetricGroupMap,
+                        sharedStreamProxy);
+
+        reader.close();
+
+        assertThat(sharedStreamProxy.isClosed()).isTrue();
     }
 
     @Test

@@ -45,6 +45,7 @@ import org.apache.flink.connector.dynamodb.source.reader.PollingDynamoDbStreamsS
 import org.apache.flink.connector.dynamodb.source.serialization.DynamoDbStreamsDeserializationSchema;
 import org.apache.flink.connector.dynamodb.source.split.DynamoDbStreamsShardSplit;
 import org.apache.flink.connector.dynamodb.source.split.DynamoDbStreamsShardSplitSerializer;
+import org.apache.flink.connector.dynamodb.source.util.DynamoDbStreamsAsyncClientUtil;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.util.Preconditions;
@@ -54,10 +55,12 @@ import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.internal.retry.SdkDefaultRetryStrategy;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.apache.ApacheHttpClient;
+import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
 import software.amazon.awssdk.retries.AdaptiveRetryStrategy;
 import software.amazon.awssdk.retries.api.BackoffStrategy;
 import software.amazon.awssdk.retries.api.RetryStrategy;
 import software.amazon.awssdk.services.dynamodb.model.Shard;
+import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsAsyncClient;
 import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
 import software.amazon.awssdk.utils.AttributeMap;
 
@@ -73,6 +76,7 @@ import java.util.function.Supplier;
 
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MAX_DELAY;
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MIN_DELAY;
+import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_GET_RECORDS_BLOCKING;
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_EMPTY_POLLS;
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_NON_EMPTY_POLLS;
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_RETRY_COUNT;
@@ -160,19 +164,30 @@ public class DynamoDbStreamsSource<T>
         final Duration getRecordsIdlePollingTimeBetweenEmptyPolls =
                 sourceConfig.get(DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_EMPTY_POLLS);
 
+        // If true, the split reader calls GetRecords on one shard at a time and waits for the
+        // response. Default - false
+        final boolean blockingGetRecords = sourceConfig.get(DYNAMODB_STREAMS_GET_RECORDS_BLOCKING);
+
         Map<String, List<Shard>> childShardMap = new ConcurrentHashMap<>();
-        // We create a new stream proxy for each split reader since they have their own independent
-        // lifecycle.
+        // All split readers of this source reader share one stream proxy. The fetcher manager
+        // creates a new split reader each time it starts a fetcher (for example, after all splits
+        // of the previous fetcher finished), and a proxy per split reader would create a new AWS
+        // SDK client, HTTP client and, for non-blocking calls, Netty event loop each time. The
+        // source reader closes the proxy.
+        DynamoDbStreamsProxy dynamoDbStreamsProxy =
+                createDynamoDbStreamsProxy(
+                        sourceConfig,
+                        SdkDefaultRetryStrategy.defaultRetryStrategy(),
+                        !blockingGetRecords);
         Supplier<PollingDynamoDbStreamsShardSplitReader> splitReaderSupplier =
                 () ->
                         new PollingDynamoDbStreamsShardSplitReader(
-                                createDynamoDbStreamsProxy(
-                                        sourceConfig,
-                                        SdkDefaultRetryStrategy.defaultRetryStrategy()),
+                                dynamoDbStreamsProxy,
                                 getRecordsIdlePollingTimeBetweenNonEmptyPolls,
                                 getRecordsIdlePollingTimeBetweenEmptyPolls,
                                 childShardMap,
-                                shardMetricGroupMap);
+                                shardMetricGroupMap,
+                                blockingGetRecords);
         DynamoDbStreamsRecordEmitter<T> recordEmitter =
                 new DynamoDbStreamsRecordEmitter<>(deserializationSchema);
 
@@ -182,7 +197,8 @@ public class DynamoDbStreamsSource<T>
                 sourceConfig,
                 readerContext,
                 childShardMap,
-                shardMetricGroupMap);
+                shardMetricGroupMap,
+                dynamoDbStreamsProxy);
     }
 
     @Override
@@ -235,6 +251,15 @@ public class DynamoDbStreamsSource<T>
 
     private DynamoDbStreamsProxy createDynamoDbStreamsProxy(
             Configuration consumerConfig, RetryStrategy retryStrategy) {
+        return createDynamoDbStreamsProxy(consumerConfig, retryStrategy, false);
+    }
+
+    /**
+     * Creates a proxy with a {@link DynamoDbStreamsClient}. If {@code withAsyncClient} is true, the
+     * proxy also gets a {@link DynamoDbStreamsAsyncClient} for non-blocking calls.
+     */
+    private DynamoDbStreamsProxy createDynamoDbStreamsProxy(
+            Configuration consumerConfig, RetryStrategy retryStrategy, boolean withAsyncClient) {
         SdkHttpClient httpClient =
                 AWSGeneralUtil.createSyncHttpClient(
                         AttributeMap.builder().build(), ApacheHttpClient.builder());
@@ -259,7 +284,15 @@ public class DynamoDbStreamsSource<T>
                         DynamodbStreamsSourceConfigConstants
                                 .BASE_DDB_STREAMS_USER_AGENT_PREFIX_FORMAT,
                         DynamodbStreamsSourceConfigConstants.DDB_STREAMS_CLIENT_USER_AGENT_PREFIX);
-        return new DynamoDbStreamsProxy(dynamoDbStreamsClient, httpClient);
+        if (!withAsyncClient) {
+            return new DynamoDbStreamsProxy(dynamoDbStreamsClient, httpClient);
+        }
+        SdkAsyncHttpClient asyncHttpClient = DynamoDbStreamsAsyncClientUtil.createAsyncHttpClient();
+        DynamoDbStreamsAsyncClient dynamoDbStreamsAsyncClient =
+                DynamoDbStreamsAsyncClientUtil.createAsyncClient(
+                        dynamoDbStreamsClientProperties, asyncHttpClient, retryStrategy);
+        return new DynamoDbStreamsProxy(
+                dynamoDbStreamsClient, httpClient, dynamoDbStreamsAsyncClient, asyncHttpClient);
     }
 
     private void setUpDeserializationSchema(SourceReaderContext sourceReaderContext)

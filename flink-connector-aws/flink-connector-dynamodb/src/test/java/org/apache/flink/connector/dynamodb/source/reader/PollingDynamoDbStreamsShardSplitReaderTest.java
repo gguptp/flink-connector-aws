@@ -29,6 +29,7 @@ import org.apache.flink.metrics.testutils.MetricListener;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.dynamodb.model.Record;
+import software.amazon.awssdk.services.dynamodb.model.Shard;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -69,12 +70,54 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
                 new DynamoDbStreamsShardMetrics(
                         TestUtil.getTestSplit(TEST_SHARD_ID), metricListener.getMetricGroup()));
         splitReader =
-                new PollingDynamoDbStreamsShardSplitReader(
+                createSplitReader(
                         testStreamProxy,
                         NON_EMPTY_POLLING_DELAY_MILLIS,
                         EMPTY_POLLING_DELAY_MILLIS,
                         new ConcurrentHashMap<>(),
                         shardMetricGroupMap);
+    }
+
+    /** Returns true to run the tests with blocking GetRecords calls. */
+    protected boolean blockingGetRecords() {
+        return false;
+    }
+
+    private PollingDynamoDbStreamsShardSplitReader createSplitReader(
+            TestDynamoDbStreamsProxy streamProxy,
+            Duration nonEmptyPollingDelay,
+            Duration emptyPollingDelay,
+            Map<String, List<Shard>> childShardMap,
+            Map<String, DynamoDbStreamsShardMetrics> shardMetrics) {
+        return new PollingDynamoDbStreamsShardSplitReader(
+                streamProxy,
+                nonEmptyPollingDelay,
+                emptyPollingDelay,
+                childShardMap,
+                shardMetrics,
+                blockingGetRecords());
+    }
+
+    @Test
+    void testUsesConfiguredGetRecordsCallStyle() {
+        testStreamProxy.addShards(TEST_SHARD_ID);
+        testStreamProxy.addRecords(
+                TestUtil.STREAM_ARN,
+                TEST_SHARD_ID,
+                Collections.singletonList(getTestRecord("data-1")));
+        splitReader.handleSplitsChanges(
+                new SplitsAddition<>(Collections.singletonList(getTestSplit(TEST_SHARD_ID))));
+
+        await().pollDelay(NON_EMPTY_POLLING_DELAY_MILLIS)
+                .untilAsserted(() -> assertThat(readAllRecords(splitReader.fetch())).hasSize(1));
+
+        if (blockingGetRecords()) {
+            assertThat(testStreamProxy.getGetRecordsCallCount()).isPositive();
+            assertThat(testStreamProxy.getGetRecordsAsyncCallCount()).isZero();
+        } else {
+            assertThat(testStreamProxy.getGetRecordsAsyncCallCount()).isPositive();
+            assertThat(testStreamProxy.getGetRecordsCallCount()).isZero();
+        }
     }
 
     @Test
@@ -405,7 +448,7 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
         // Use a very long delay for this test to ensure it's not flaky
         Duration testEmptyPollDelay = Duration.ofMinutes(1);
         splitReader =
-                new PollingDynamoDbStreamsShardSplitReader(
+                createSplitReader(
                         testStreamProxy,
                         NON_EMPTY_POLLING_DELAY_MILLIS,
                         testEmptyPollDelay,
@@ -510,9 +553,9 @@ class PollingDynamoDbStreamsShardSplitReaderTest {
     }
 
     @Test
-    void testCloseClosesStreamProxy() {
+    void testCloseDoesNotCloseSharedStreamProxy() {
         assertThatNoException().isThrownBy(splitReader::close);
-        assertThat(testStreamProxy.isClosed()).isTrue();
+        assertThat(testStreamProxy.isClosed()).isFalse();
     }
 
     private List<Record> readAllRecords(RecordsWithSplitIds<Record> recordsWithSplitIds) {

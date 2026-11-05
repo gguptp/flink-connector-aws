@@ -25,16 +25,19 @@ import org.apache.flink.connector.dynamodb.source.util.ListShardsResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.http.SdkHttpClient;
+import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
 import software.amazon.awssdk.services.dynamodb.model.DescribeStreamRequest;
 import software.amazon.awssdk.services.dynamodb.model.DescribeStreamResponse;
 import software.amazon.awssdk.services.dynamodb.model.ExpiredIteratorException;
 import software.amazon.awssdk.services.dynamodb.model.GetRecordsRequest;
 import software.amazon.awssdk.services.dynamodb.model.GetRecordsResponse;
 import software.amazon.awssdk.services.dynamodb.model.GetShardIteratorRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetShardIteratorResponse;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.dynamodb.model.ShardFilter;
 import software.amazon.awssdk.services.dynamodb.model.StreamStatus;
 import software.amazon.awssdk.services.dynamodb.model.TrimmedDataAccessException;
+import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsAsyncClient;
 import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
 
 import javax.annotation.Nullable;
@@ -44,7 +47,10 @@ import java.time.Instant;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 /** Implementation of the {@link StreamProxy} for DynamoDB streams. */
 @Internal
@@ -52,7 +58,16 @@ public class DynamoDbStreamsProxy implements StreamProxy {
 
     private final DynamoDbStreamsClient dynamoDbStreamsClient;
     private final SdkHttpClient httpClient;
+
+    /**
+     * Client for the non-blocking methods {@link #getRecordsAsync} and {@link
+     * #listShardsWithFilterAsync}. {@code null} if the proxy only makes blocking calls.
+     */
+    @Nullable private final DynamoDbStreamsAsyncClient dynamoDbStreamsAsyncClient;
+
+    @Nullable private final SdkAsyncHttpClient asyncHttpClient;
     private final Map<String, String> shardIdToIteratorStore;
+
     private static final GetRecordsResponse EMPTY_GET_RECORDS_RESPONSE =
             GetRecordsResponse.builder()
                     .records(Collections.emptyList())
@@ -63,8 +78,23 @@ public class DynamoDbStreamsProxy implements StreamProxy {
 
     public DynamoDbStreamsProxy(
             DynamoDbStreamsClient dynamoDbStreamsClient, SdkHttpClient httpClient) {
+        this(dynamoDbStreamsClient, httpClient, null, null);
+    }
+
+    /**
+     * Creates a proxy that can also make non-blocking calls. The proxy uses {@code
+     * dynamoDbStreamsAsyncClient} for {@link #getRecordsAsync} and {@link
+     * #listShardsWithFilterAsync}, and {@code dynamoDbStreamsClient} for all other methods.
+     */
+    public DynamoDbStreamsProxy(
+            DynamoDbStreamsClient dynamoDbStreamsClient,
+            SdkHttpClient httpClient,
+            @Nullable DynamoDbStreamsAsyncClient dynamoDbStreamsAsyncClient,
+            @Nullable SdkAsyncHttpClient asyncHttpClient) {
         this.dynamoDbStreamsClient = dynamoDbStreamsClient;
         this.httpClient = httpClient;
+        this.dynamoDbStreamsAsyncClient = dynamoDbStreamsAsyncClient;
+        this.asyncHttpClient = asyncHttpClient;
         this.shardIdToIteratorStore = new ConcurrentHashMap<>();
     }
 
@@ -160,10 +190,138 @@ public class DynamoDbStreamsProxy implements StreamProxy {
         }
     }
 
+    /**
+     * Non-blocking version of {@link #getRecords(String, String, StartingPosition)}. Each step
+     * matches a step of the blocking method: the shard iterator store, the retry after
+     * ExpiredIteratorException, the read from TRIM_HORIZON after TrimmedDataAccessException, and
+     * the empty response after ResourceNotFoundException.
+     */
+    @Override
+    public CompletableFuture<GetRecordsResponse> getRecordsAsync(
+            String streamArn, String shardId, StartingPosition startingPosition) {
+        DynamoDbStreamsAsyncClient asyncClient = getAsyncClient();
+
+        String storedShardIterator = shardIdToIteratorStore.get(shardId);
+        CompletableFuture<String> shardIteratorFuture =
+                storedShardIterator != null
+                        ? CompletableFuture.completedFuture(storedShardIterator)
+                        : getShardIteratorAsync(asyncClient, streamArn, shardId, startingPosition)
+                                .thenApply(
+                                        shardIterator -> {
+                                            if (shardIterator != null) {
+                                                shardIdToIteratorStore.put(shardId, shardIterator);
+                                            }
+                                            return shardIterator;
+                                        });
+
+        return shardIteratorFuture.thenCompose(
+                shardIterator -> {
+                    if (shardIterator == null) {
+                        return CompletableFuture.completedFuture(EMPTY_GET_RECORDS_RESPONSE);
+                    }
+                    return getRecordsAsync(asyncClient, shardIterator)
+                            .thenApply(response -> storeNextShardIterator(shardId, response))
+                            // Same as exceptionallyCompose, which needs Java 12.
+                            .handle(
+                                    (response, error) ->
+                                            error == null
+                                                    ? CompletableFuture.completedFuture(response)
+                                                    : recoverGetRecordsAsync(
+                                                            asyncClient,
+                                                            streamArn,
+                                                            shardId,
+                                                            startingPosition,
+                                                            unwrap(error)))
+                            .thenCompose(Function.identity());
+                });
+    }
+
+    private CompletableFuture<GetRecordsResponse> recoverGetRecordsAsync(
+            DynamoDbStreamsAsyncClient asyncClient,
+            String streamArn,
+            String shardId,
+            StartingPosition startingPosition,
+            Throwable error) {
+        if (error instanceof ExpiredIteratorException) {
+            LOG.info(
+                    "Received ExpiredIteratorException from GetRecords. "
+                            + "Calling GetShardIterator for shard: {} with position: {}",
+                    shardId,
+                    startingPosition);
+            // Eagerly retry getRecords() if the iterator is expired
+            return getShardIteratorAsync(asyncClient, streamArn, shardId, startingPosition)
+                    .thenCompose(shardIterator -> getRecordsAsync(asyncClient, shardIterator))
+                    .thenApply(response -> storeNextShardIterator(shardId, response));
+        }
+        if (error instanceof TrimmedDataAccessException) {
+            // TrimmedDataAccessException means that the record pointed by shard iterator has
+            // expired. We should read the shard back from TRIM_HORIZON
+            LOG.warn(
+                    "Received TrimmedDataAccessException from GetRecords. "
+                            + "Calling GetShardIterator for shard: {} with TRIM_HORIZON",
+                    shardId);
+            return getShardIteratorAsync(
+                            asyncClient, streamArn, shardId, StartingPosition.fromStart())
+                    .thenCompose(shardIterator -> getRecordsAsync(asyncClient, shardIterator))
+                    .thenApply(response -> storeNextShardIterator(shardId, response));
+        }
+        if (error instanceof ResourceNotFoundException) {
+            LOG.warn(
+                    "Received ResourceNotFoundException from GetRecords for shard: {}. "
+                            + "This might indicate that there is restore happening from stale snapshot or data loss from backpressure",
+                    shardId);
+            return CompletableFuture.completedFuture(EMPTY_GET_RECORDS_RESPONSE);
+        }
+        return CompletableFuture.failedFuture(error);
+    }
+
+    /** Non-blocking version of {@link #listShardsWithFilter(String, ShardFilter)}. */
+    @Override
+    public CompletableFuture<ListShardsResult> listShardsWithFilterAsync(
+            String streamArn, ShardFilter shardFilter) {
+        DynamoDbStreamsAsyncClient asyncClient = getAsyncClient();
+        LOG.debug("Child shards with filter called, for shardId: {}", shardFilter.shardId());
+        final DescribeStreamRequest describeStreamRequest =
+                DescribeStreamRequest.builder()
+                        .streamArn(streamArn)
+                        .shardFilter(shardFilter)
+                        .build();
+        return asyncClient
+                .describeStream(describeStreamRequest)
+                .thenApply(
+                        describeStreamResponse -> {
+                            logIfStreamIsEnabling(streamArn, describeStreamResponse);
+                            ListShardsResult listShardsResult = new ListShardsResult();
+                            listShardsResult.addShards(
+                                    describeStreamResponse.streamDescription().shards());
+                            listShardsResult.setStreamStatus(
+                                    describeStreamResponse.streamDescription().streamStatus());
+                            return listShardsResult;
+                        })
+                .exceptionally(
+                        error -> {
+                            LOG.warn(
+                                    "DescribeStream with Filter API threw an exception",
+                                    unwrap(error));
+                            return new ListShardsResult();
+                        })
+                .thenApply(
+                        listShardsResult -> {
+                            LOG.info("Child shards returned for shardId: {}", listShardsResult);
+                            return listShardsResult;
+                        });
+    }
+
     @Override
     public void close() throws IOException {
         dynamoDbStreamsClient.close();
         httpClient.close();
+        if (dynamoDbStreamsAsyncClient != null) {
+            dynamoDbStreamsAsyncClient.close();
+        }
+        if (asyncHttpClient != null) {
+            asyncHttpClient.close();
+        }
     }
 
     private DescribeStreamResponse describeStream(String streamArn, @Nullable String startShardId) {
@@ -216,6 +374,50 @@ public class DynamoDbStreamsProxy implements StreamProxy {
 
     private String getShardIterator(
             String streamArn, String shardId, StartingPosition startingPosition) {
+        GetShardIteratorRequest getShardIteratorRequest =
+                buildGetShardIteratorRequest(streamArn, shardId, startingPosition);
+        try {
+            return dynamoDbStreamsClient.getShardIterator(getShardIteratorRequest).shardIterator();
+        } catch (ResourceNotFoundException e) {
+            logGetShardIteratorResourceNotFound(streamArn, shardId);
+            return null;
+        } catch (TrimmedDataAccessException e) {
+            logGetShardIteratorTrimmedDataAccess(streamArn, shardId);
+            return null;
+        }
+    }
+
+    /**
+     * Non-blocking version of {@link #getShardIterator(String, String, StartingPosition)}. The
+     * future completes with {@code null} where the blocking method returns {@code null}.
+     */
+    private CompletableFuture<String> getShardIteratorAsync(
+            DynamoDbStreamsAsyncClient asyncClient,
+            String streamArn,
+            String shardId,
+            StartingPosition startingPosition) {
+        GetShardIteratorRequest getShardIteratorRequest =
+                buildGetShardIteratorRequest(streamArn, shardId, startingPosition);
+        return asyncClient
+                .getShardIterator(getShardIteratorRequest)
+                .thenApply(GetShardIteratorResponse::shardIterator)
+                .exceptionally(
+                        error -> {
+                            Throwable cause = unwrap(error);
+                            if (cause instanceof ResourceNotFoundException) {
+                                logGetShardIteratorResourceNotFound(streamArn, shardId);
+                                return null;
+                            }
+                            if (cause instanceof TrimmedDataAccessException) {
+                                logGetShardIteratorTrimmedDataAccess(streamArn, shardId);
+                                return null;
+                            }
+                            throw new CompletionException(cause);
+                        });
+    }
+
+    private static GetShardIteratorRequest buildGetShardIteratorRequest(
+            String streamArn, String shardId, StartingPosition startingPosition) {
         GetShardIteratorRequest.Builder requestBuilder =
                 GetShardIteratorRequest.builder()
                         .streamArn(streamArn)
@@ -247,26 +449,25 @@ public class DynamoDbStreamsProxy implements StreamProxy {
                             "Invalid object given for GetShardIteratorRequest() when ShardIteratorType is AT_SEQUENCE_NUMBER or AFTER_SEQUENCE_NUMBER. Must be a String.");
                 }
         }
+        return requestBuilder.build();
+    }
 
-        try {
-            return dynamoDbStreamsClient.getShardIterator(requestBuilder.build()).shardIterator();
-        } catch (ResourceNotFoundException e) {
-            LOG.warn(
-                    "Received ResourceNotFoundException from GetShardIterator. "
-                            + "Shard {} of stream {} is no longer valid, marking it as complete."
-                            + "This might indicate that there is restore happening from stale snapshot or data loss from backpressure",
-                    shardId,
-                    streamArn);
-            return null;
-        } catch (TrimmedDataAccessException e) {
-            LOG.warn(
-                    "Received TrimmedDataAccessException from GetShardIterator. "
-                            + "Shard {} of stream {} is no longer valid, marking it as complete."
-                            + "This might indicate that there is restore happening from stale snapshot or data loss from backpressure",
-                    shardId,
-                    streamArn);
-            return null;
-        }
+    private static void logGetShardIteratorResourceNotFound(String streamArn, String shardId) {
+        LOG.warn(
+                "Received ResourceNotFoundException from GetShardIterator. "
+                        + "Shard {} of stream {} is no longer valid, marking it as complete."
+                        + "This might indicate that there is restore happening from stale snapshot or data loss from backpressure",
+                shardId,
+                streamArn);
+    }
+
+    private static void logGetShardIteratorTrimmedDataAccess(String streamArn, String shardId) {
+        LOG.warn(
+                "Received TrimmedDataAccessException from GetShardIterator. "
+                        + "Shard {} of stream {} is no longer valid, marking it as complete."
+                        + "This might indicate that there is restore happening from stale snapshot or data loss from backpressure",
+                shardId,
+                streamArn);
     }
 
     private GetRecordsResponse getRecords(String shardIterator) {
@@ -275,5 +476,50 @@ public class DynamoDbStreamsProxy implements StreamProxy {
         }
         return dynamoDbStreamsClient.getRecords(
                 GetRecordsRequest.builder().shardIterator(shardIterator).build());
+    }
+
+    private CompletableFuture<GetRecordsResponse> getRecordsAsync(
+            DynamoDbStreamsAsyncClient asyncClient, @Nullable String shardIterator) {
+        if (Objects.isNull(shardIterator)) {
+            return CompletableFuture.completedFuture(EMPTY_GET_RECORDS_RESPONSE);
+        }
+        return asyncClient.getRecords(
+                GetRecordsRequest.builder().shardIterator(shardIterator).build());
+    }
+
+    private GetRecordsResponse storeNextShardIterator(
+            String shardId, GetRecordsResponse getRecordsResponse) {
+        if (getRecordsResponse.nextShardIterator() != null) {
+            shardIdToIteratorStore.put(shardId, getRecordsResponse.nextShardIterator());
+        }
+        return getRecordsResponse;
+    }
+
+    private DynamoDbStreamsAsyncClient getAsyncClient() {
+        if (dynamoDbStreamsAsyncClient == null) {
+            throw new IllegalStateException(
+                    "DynamoDbStreamsProxy has no DynamoDbStreamsAsyncClient. "
+                            + "Non-blocking calls are not available.");
+        }
+        return dynamoDbStreamsAsyncClient;
+    }
+
+    private static void logIfStreamIsEnabling(
+            String streamArn, DescribeStreamResponse describeStreamResponse) {
+        StreamStatus streamStatus = describeStreamResponse.streamDescription().streamStatus();
+        if (StreamStatus.ENABLING.equals(streamStatus) && LOG.isWarnEnabled()) {
+            LOG.warn(
+                    String.format(
+                            "The status of stream %s is %s ; result of the current "
+                                    + "describeStream operation will not contain any shard information.",
+                            streamArn, streamStatus));
+        }
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        // CompletableFuture wraps a failure in at most one CompletionException.
+        return error instanceof CompletionException && error.getCause() != null
+                ? error.getCause()
+                : error;
     }
 }

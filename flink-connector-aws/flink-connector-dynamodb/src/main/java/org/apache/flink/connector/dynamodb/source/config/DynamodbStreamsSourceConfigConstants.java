@@ -102,6 +102,23 @@ public class DynamodbStreamsSourceConfigConstants {
                             .withDescription(
                                     "The default idle time between non-empty polls for DynamoDB Streams GetRecords API");
 
+    public static final ConfigOption<Boolean> DYNAMODB_STREAMS_GET_RECORDS_BLOCKING =
+            ConfigOptions.key("flink.dynamodbstreams.getrecords.blocking")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, each source reader calls GetRecords on one shard at a time and"
+                                    + " waits for the response. If false, each source reader calls"
+                                    + " GetRecords on all ready shards without waiting for the"
+                                    + " responses, so a slow call on one shard does not delay the"
+                                    + " other shards.");
+
+    /**
+     * The maximum time that a non-blocking split reader waits for a response in one fetch. The
+     * reader also returns when a shard is ready for its next call, or when Flink wakes it up.
+     */
+    public static final Duration NON_BLOCKING_FETCH_MAX_WAIT = Duration.ofMillis(100);
+
     public static final int MAX_RETRY_ATTEMPTS_FOR_CHILD_SHARDS = 5;
     public static final long CHILD_SHARD_DISCOVERY_MIN_DELAY_MS = 100;
     public static final long CHILD_SHARD_DISCOVERY_MAX_DELAY_MS = 1000;
